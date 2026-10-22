@@ -1,7 +1,7 @@
+using System.Buffers.Binary;
 using System.Net.Sockets;
 using System.Net.WebSockets;
 using System.Text;
-using System.Text.RegularExpressions;
 
 namespace DunjeonLab.Domain.Network.Websocket;
 
@@ -36,9 +36,14 @@ public class WebSocketConnection(Socket socket)
 
     private readonly byte[] _dataBuffer = new byte[1024];
     private readonly List<byte> _pendingBytes = [];
+    private byte[]? _pendingPingPayload;
+    private long _pingSequence;
     
     private PayloadDataType? _fragmentedMessageType;
     private readonly List<byte> _messageBytes = [];
+    
+    private readonly CancellationTokenSource _connectionCts = new();
+    private Task? _keepAliveTask;
     public async Task RunAsync()
     {
         while (true)
@@ -67,10 +72,14 @@ public class WebSocketConnection(Socket socket)
                     State = WebSocketState.Closed;
                     return;
                 }
-
                 if (result == HandshakeResult.NeedMoreData)
                 {
                     continue; // 다음 ReceiveAsync로 추가 수신
+                }
+                else if (result == HandshakeResult.Completed)
+                {
+                    // 주기 루프 시작
+                    _keepAliveTask = KeepAliveLoopAsync(_connectionCts.Token);
                 }
             }
             
@@ -78,7 +87,7 @@ public class WebSocketConnection(Socket socket)
             {
                 while (true)
                 {
-                    FrameReadResult result = ProcessClientRequest();
+                    FrameReadResult result = await ProcessClientRequest();
 
                     if (result == FrameReadResult.NeedMoreData)
                     {
@@ -234,7 +243,7 @@ public class WebSocketConnection(Socket socket)
         return HandshakeResult.Completed;
     }
 
-    private FrameReadResult ProcessClientRequest()
+    private async Task<FrameReadResult> ProcessClientRequest()
     {
         if (_pendingBytes.Count < 2)
         {
@@ -254,6 +263,7 @@ public class WebSocketConnection(Socket socket)
         // 확장을 협상하지 않았으므로 RSV 비트는 모두 0이어야 함
         // 클라이언트가 보내는 프레임은 마스킹되어야 함
         if (reservedBits != 0 || !mask) return FrameReadResult.Invalid;
+        if (IsInvalidControlFrame(opcode, lengthCode, fin)) return FrameReadResult.Invalid;
         
         ulong msglen = (ulong)lengthCode;
         ulong offset = 2;
@@ -312,7 +322,7 @@ public class WebSocketConnection(Socket socket)
             case PayloadDataType.Binary:
             {
                 // 이전 메시지가 끝나지 않았는데 새 메시지가 시작되면 오류
-                if (_fragmentedMessageType is not null)
+                if (_fragmentedMessageType != null)
                 {
                     return FrameReadResult.Invalid;
                 }
@@ -328,6 +338,32 @@ public class WebSocketConnection(Socket socket)
                     _messageBytes.AddRange(decoded);
                 }
 
+                break;
+            }
+            case PayloadDataType.Continuation:
+            {
+                if (_fragmentedMessageType == null) return FrameReadResult.Invalid;
+                if (_messageBytes.Count + decoded.Length > (int)maxPayloadLength) return FrameReadResult.Invalid;
+                
+                _messageBytes.AddRange(decoded);
+
+                if (fin)
+                {
+                    if (!ProcessCompleteMessage(_fragmentedMessageType.Value, _messageBytes.ToArray())) return FrameReadResult.Invalid;
+                    
+                    _messageBytes.Clear();
+                    _fragmentedMessageType = null;
+                }
+                
+                break;
+            }
+            case PayloadDataType.Ping:
+            {
+                if (!await SendControlFrameAsync(PayloadDataType.Pong, decoded)) return FrameReadResult.Invalid;
+                break;
+            }
+            case PayloadDataType.Pong:
+            {
                 break;
             }
 
@@ -368,5 +404,86 @@ public class WebSocketConnection(Socket socket)
 
         return true;
     }
+
+    private async Task<bool> SendControlFrameAsync(PayloadDataType opcode, byte[] payload)
+    {
+        if (IsInvalidControlFrame(opcode, payload.Length, true)) return false;
+
+        byte[] frame = new byte[2 + payload.Length];
+        
+        // FIN과 opcode를 합침
+        frame[0] = (byte)(0b10000000 | (byte)opcode);
+        
+        // 제어 프레임은 본문이 최대 125바이트이므로 길이를 직접 기록
+        // 서버 송신 프레임이라 MASK는 0
+        frame[1] = (byte)payload.Length;
+        payload.CopyTo(frame, 2);
+
+        int sent = 0;
+
+        while (sent < frame.Length)
+        {
+            int count = await socket.SendAsync(frame.AsMemory(sent), SocketFlags.None);
+
+            if (count == 0) return false;
+            
+            sent += count;
+        }
+        
+        return true;
+    }
     
+    private async Task<bool> SendPingAsync()
+    {
+        // 연결이 열려 있고, 이전 Ping의 응답을 기다리지 않을 때만 전송
+        if (State != WebSocketState.Open || _pendingPingPayload is not null)
+        {
+            return false;
+        }
+
+        // 요청 번호 1, 2, 3, ...을 8바이트 빅엔디언 본문
+        byte[] payload = new byte[sizeof(long)];
+        BinaryPrimitives.WriteInt64BigEndian(payload, ++_pingSequence);
+
+        // 빠른 Pong 응답과도 비교할 수 있도록 전송 전에 저장합니다.
+        _pendingPingPayload = payload;
+
+        try
+        {
+            bool sent = await SendControlFrameAsync(PayloadDataType.Ping, payload);
+            if (!sent) _pendingPingPayload = null;
+            return sent;
+        }
+        catch
+        {
+            // 전송 예외가 발생해도 대기 상태를 남기지 않고 호출자에게 알림
+            _pendingPingPayload = null;
+            throw;
+        }
+    }
+
+    private async Task KeepAliveLoopAsync(CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
+
+        try
+        {
+            while (await timer.WaitForNextTickAsync(ct))
+            {
+                Console.WriteLine("Ping을 보낼 시점인지 확인");
+                // TODO: 전송 시점과 응답 타임아웃 검사
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // 연결 정료 등 요청한 정상적인 취소
+        }
+    }
+
+    // 제어 프레임과 유효성 검사 함수
+    private static bool IsInvalidControlFrame(PayloadDataType opcode, int len, bool fin)
+    {
+        return opcode is PayloadDataType.Ping or PayloadDataType.Pong or PayloadDataType.ConnectionClose 
+               && (!fin || len > 125);
+    }
 }
