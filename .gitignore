@@ -1,0 +1,22 @@
+# .NET build artifacts
+**/bin/
+**/obj/
+
+# JetBrains IDE settings
+.idea/
+
+# User-specific IDE files
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Test and coverage output
+TestResults/
+coverage/
+*.coverage
+*.coveragexml
+
+# OS metadata
+.DS_Store
+Thumbs.db
